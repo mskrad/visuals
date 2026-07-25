@@ -237,6 +237,10 @@ let strBeat = -1;
 
 function pluck(s, t){ strPluck[s]=1; strLastHit[s]=t; strHits[s]++; }
 
+// Треугольная волна вместо синуса: у щипнутой струны излом острый, а не гладкий.
+// tri(x) повторяет sin(x) по нулям и пикам, но между ними идёт прямой линией.
+function tri(x){ return Math.asin(Math.sin(x))*(2/Math.PI); }
+
 function stringsAnalyse(t, dt){
   const kd = Math.min(1, dt/1000);
   if (micOn && analyser && freqData){
@@ -1029,8 +1033,8 @@ const strings5 = S('5 STRINGS',
         ctx.beginPath();
         for (let i=0;i<=N;i++){
           const u=i/N;
-          const d=amp*(Math.sin(Math.PI*mode*u)*Math.sin(w)
-                     + 0.3*Math.sin(Math.PI*(mode+1)*u)*Math.sin(w*1.6+1.1));
+          const d=amp*(tri(Math.PI*mode*u)*Math.sin(w)
+                     + 0.3*tri(Math.PI*(mode+1)*u)*Math.sin(w*1.6+1.1));
           if (i) ctx.lineTo(x0+span*u, y0+d); else ctx.moveTo(x0+span*u, y0+d);
         }
         ctx.strokeStyle=NEON[col];
@@ -1044,7 +1048,7 @@ const strings5 = S('5 STRINGS',
       // иконки катаются на пучностях — их столько, сколько нот в полосе
       for (let k=0;k<mode;k++){
         const u=(2*k+1)/(2*mode);
-        const d=amp*Math.sin(Math.PI*mode*u)*Math.sin(w);
+        const d=amp*tri(Math.PI*mode*u)*Math.sin(w);
         icon(ctx,(this.ic[s]+k)%NICON, col, x0+span*u, y0+d,
           gap*0.52*(0.5+lvl*0.45+pl*0.35), d*0.004, 0.7+lvl*0.3);
       }
@@ -1141,7 +1145,7 @@ const radialEq = S('RADIAL EQ',
       ctx.beginPath();
       for (let i=0;i<=NP;i++){
         const a=i/NP*Math.PI*2 + this.rot*dir;
-        const r=r0+amp*Math.sin(lobes*a+ph);
+        const r=r0+amp*tri(lobes*a+ph);      // острые лучи вместо гладкой волны
         const x=CX+Math.cos(a)*r, y=CY+Math.sin(a)*r;
         if (i) ctx.lineTo(x,y); else ctx.moveTo(x,y);
       }
@@ -1215,24 +1219,35 @@ mirrorEq.needsMic = true;
 // Две версии: белая и цветная.
 function plainEq(name, colorful){
   const sc = S(name,
-    function(){ this.pts=Math.max(60,Math.min(220,Math.round(W/6))); },
+    function(){ this.pts=Math.max(80,Math.min(260,Math.round(W/5))); },
     function(ctx,t,dt){
-      ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
+      // послесвечение люминофора вместо чистой заливки — след луча гаснет не сразу
+      ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.fillRect(0,0,W,H);
       const N=this.pts, gap=H/(NSTR+1);
       const x0=W*0.05, x1=W*0.95, span=x1-x0;
+      ctx.lineJoin='miter'; ctx.miterLimit=6; ctx.lineCap='butt';
       for (let s=0;s<NSTR;s++){
         const y0=gap*(s+1), lvl=strLvl[s], pl=strPluck[s], w=strPhase[s];
         const mode=1+Math.round(strNote[s]*4);
-        const amp=gap*0.45*(0.04+lvl*0.5+pl*0.6);
+        // аналоговый прибор не держит масштаб идеально — амплитуда чуть плывёт
+        const amp=gap*0.45*(0.04+lvl*0.5+pl*0.6)*(1+0.05*Math.sin(t*0.0009+s));
+        const hum=Math.sin(t*0.0021+s*1.7)*gap*0.014;   // дрейф нуля, как у стрелочного прибора
         ctx.beginPath();
         for (let i=0;i<=N;i++){
           const u=i/N;
-          const d=amp*Math.sin(Math.PI*mode*u)*Math.sin(w);
+          const k=tri(Math.PI*mode*u);
+          // вершину поднимаем степенью — излом получается острее самого треугольника
+          let d=amp*Math.sign(k)*Math.pow(Math.abs(k),0.75)*Math.sin(w);
+          // звон после щипка: высокая гармоника, гаснет вместе с огибающей
+          d+=amp*pl*0.18*tri(Math.PI*(mode*3+1)*u)*Math.sin(w*3.1);
+          d+=hum + amp*0.05*Math.sin(u*9.7+t*0.0013+s*2.1);   // увод пера
           if (i) ctx.lineTo(x0+span*u, y0+d); else ctx.moveTo(x0+span*u, y0+d);
         }
         ctx.strokeStyle = colorful ? NEON[STR_COL[s]] : '#fff';
-        ctx.lineWidth = 2+lvl*3;
-        ctx.stroke();
+        ctx.globalCompositeOperation='lighter';
+        ctx.globalAlpha=0.1+lvl*0.1;  ctx.lineWidth=5+lvl*7;   ctx.stroke();
+        ctx.globalAlpha=1;            ctx.lineWidth=1.6+lvl*1.8; ctx.stroke();
+        ctx.globalCompositeOperation='source-over';
       }
     });
   sc.needsMic = true;
