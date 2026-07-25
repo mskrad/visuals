@@ -1210,7 +1210,38 @@ const mirrorEq = S('MIRROR EQ',
   });
 mirrorEq.needsMic = true;
 
-const scenes = [strings5, barEq, ledEq, radialEq, mirrorEq,
+// 0а. Голый эквалайзер: пять полос и ничего больше — ни иконок, ни искр,
+// ни шкал, ни свечения. Громкость полосы — размах, нота — число пучностей.
+// Две версии: белая и цветная.
+function plainEq(name, colorful){
+  const sc = S(name,
+    function(){ this.pts=Math.max(60,Math.min(220,Math.round(W/6))); },
+    function(ctx,t,dt){
+      ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
+      const N=this.pts, gap=H/(NSTR+1);
+      const x0=W*0.05, x1=W*0.95, span=x1-x0;
+      for (let s=0;s<NSTR;s++){
+        const y0=gap*(s+1), lvl=strLvl[s], pl=strPluck[s], w=strPhase[s];
+        const mode=1+Math.round(strNote[s]*4);
+        const amp=gap*0.45*(0.04+lvl*0.5+pl*0.6);
+        ctx.beginPath();
+        for (let i=0;i<=N;i++){
+          const u=i/N;
+          const d=amp*Math.sin(Math.PI*mode*u)*Math.sin(w);
+          if (i) ctx.lineTo(x0+span*u, y0+d); else ctx.moveTo(x0+span*u, y0+d);
+        }
+        ctx.strokeStyle = colorful ? NEON[STR_COL[s]] : '#fff';
+        ctx.lineWidth = 2+lvl*3;
+        ctx.stroke();
+      }
+    });
+  sc.needsMic = true;
+  return sc;
+}
+const plainMono  = plainEq('5 BANDS', false);
+const plainColor = plainEq('5 BANDS COLOR', true);
+
+const scenes = [plainMono, plainColor, strings5, barEq, ledEq, radialEq, mirrorEq,
   mega, warp, kaleido, acid, plasma, grid, zoomT, floor, plasmaBW,
   matrix, rings, strobe, fireworks,
   pendulum, lissa, radar, ripple, horizon, rotor, ink, moire, poly, spot];
@@ -1448,7 +1479,7 @@ requestAnimationFrame(loop);
 const standalone = window.navigator.standalone === true ||
   (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
 const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
-flashMsg('1 / '+scenes.length+' · 5 STRINGS — тап: сцена · 2 пальца: темп · 3: 🎤 · 4: синхрон видео');
+flashMsg('1 / '+scenes.length+' · '+scenes[0].name+' — тап: сцена · 2 пальца: темп · 3: 🎤 · 4: синхрон видео');
 if (isIOS && !standalone){
   setTimeout(()=>flashMsg('Поделиться → На экран «Домой» — тогда будет весь экран'), 6000);
 }
