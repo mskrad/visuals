@@ -212,6 +212,76 @@ function micAnalyse(now){
   }
 }
 
+// ---------- 5 струн: разбор входящего сигнала на полосы ----------
+// Струна = полоса спектра по лог-шкале: бас, низ, середина, верх, воздух.
+// По каждой полосе держим:
+//   strLvl   — уровень с авто-усилением (без него верхние струны всегда молчат);
+//   strNote  — где внутри полосы сидит доминирующая частота, 0..1. Это «нота»:
+//              из неё берётся число пучностей, поэтому струна отыгрывает мелодию,
+//              а не просто дёргается на громкость;
+//   strPluck — огибающая щипка по атаке в полосе;
+//   strPhase — фаза дрожания, тем быстрее, чем выше нота;
+//   strHits  — счётчик щипков, по нему сцена сыплет искры.
+const NSTR = 5;
+const STR_HZ = [30, 110, 320, 900, 2600, 9000];
+const STR_COL = [0, 3, 2, 1, 4];        // индексы в NEON: бас красный … воздух фиолетовый
+const strLvl     = new Float32Array(NSTR);
+const strNote    = new Float32Array(NSTR).fill(0.5);
+const strPluck   = new Float32Array(NSTR);
+const strPhase   = new Float32Array(NSTR);
+const strHits    = new Int32Array(NSTR);
+const strRef     = new Float32Array(NSTR).fill(0.05);  // скользящий максимум полосы
+const strAvg     = new Float32Array(NSTR);             // медленное среднее — порог атаки
+const strLastHit = new Float32Array(NSTR);
+let strBeat = -1;
+
+function pluck(s, t){ strPluck[s]=1; strLastHit[s]=t; strHits[s]++; }
+
+function stringsAnalyse(t, dt){
+  const kd = Math.min(1, dt/1000);
+  if (micOn && analyser && freqData){
+    const nyq = audioCtx.sampleRate/2, bins = freqData.length;
+    for (let s=0;s<NSTR;s++){
+      const lo = Math.max(1, Math.round(STR_HZ[s]/nyq*bins));
+      const hi = Math.max(lo+1, Math.min(bins-1, Math.round(STR_HZ[s+1]/nyq*bins)));
+      let sum=0, bi=lo, bv=-1;
+      for (let i=lo;i<=hi;i++){
+        const v=freqData[i]; sum+=v;
+        if (v>bv){ bv=v; bi=i; }
+      }
+      const e = sum/((hi-lo+1)*255);
+      // максимум полосы быстро растёт и медленно тает (~2.5 с) — это и есть авто-усиление
+      strRef[s] = Math.max(e, strRef[s]*(1-kd*0.4));
+      const lvl = Math.min(1, e/Math.max(0.03, strRef[s]));
+      strLvl[s] += (lvl-strLvl[s])*Math.min(1, dt/60);
+      if (bv>12) strNote[s] += (Math.log(bi/lo)/Math.log(hi/lo) - strNote[s])*Math.min(1, dt/180);
+      strAvg[s] += (lvl-strAvg[s])*Math.min(1, dt/420);
+      if (lvl>strAvg[s]+0.16 && lvl>0.3 && t-strLastHit[s]>110) pluck(s, t);
+    }
+  } else {
+    // без микрофона струны отыгрывают тактовый генератор: бас на каждую долю,
+    // остальные — по рисунку на 8 долей, чтобы было что слушать глазами
+    const bc = beatCount(t), p = beatPulse(t);
+    const pat = [0,2,1,4,0,3,1,2];
+    const lead = pat[((bc%8)+8)%8];
+    if (bc!==strBeat){
+      strBeat = bc;
+      pluck(0, t);
+      if (lead!==0) pluck(lead, t);
+    }
+    for (let s=0;s<NSTR;s++){
+      const on = (s===0 || lead===s);
+      const target = on ? 0.3+p*0.7 : 0.12+p*0.1;
+      strLvl[s] += (target-strLvl[s])*Math.min(1, dt/70);
+      strNote[s] += ((0.5+0.42*Math.sin(bc*0.7+s*1.9)) - strNote[s])*Math.min(1, dt/220);
+    }
+  }
+  for (let s=0;s<NSTR;s++){
+    strPluck[s] *= Math.exp(-dt/280);
+    strPhase[s] = (strPhase[s] + dt*0.001*2*Math.PI*(2.4+(1+strNote[s]*4)*1.15)) % (Math.PI*2);
+  }
+}
+
 // ================= 20 СЦЕН =================
 
 
@@ -908,7 +978,240 @@ const acid = S('ACID PLASMA',
     ctx.drawImage(this.buf, -ov+dx, -ov+dy, W+ov*2, H+ov*2);
   });
 
-const scenes = [mega, warp, kaleido, acid, plasma, grid, zoomT, floor, plasmaBW,
+// 0. 5 STRINGS — пятиструнный эквалайзер.
+// Пять полос спектра натянуты между порожком и бриджем. Громкость полосы —
+// размах струны и длина шкалы, доминирующая частота — число пучностей: струна
+// делится на 1…5 частей и «берёт ноту». Атака в полосе = щипок: вспышка колка
+// и искры из пучностей.
+const strings5 = S('5 STRINGS',
+  function(){
+    this.pts = Math.max(60, Math.min(200, Math.round(W/7)));
+    this.spark = [];
+    this.seen = new Int32Array(NSTR);
+    this.ic = [];
+    for (let s=0;s<NSTR;s++) this.ic.push(rnd(NICON));
+  },
+  function(ctx,t,dt){
+    ctx.fillStyle='rgba(0,0,0,0.3)'; ctx.fillRect(0,0,W,H);
+    const N=this.pts, gap=H/(NSTR+1);
+    const x0=Math.max(MIN*0.09,40), x1=W-Math.max(MIN*0.05,22), span=x1-x0;
+
+    ctx.strokeStyle='rgba(255,255,255,0.16)'; ctx.lineWidth=2;
+    ctx.beginPath();
+    ctx.moveTo(x0,gap*0.45); ctx.lineTo(x0,H-gap*0.45);
+    ctx.moveTo(x1,gap*0.45); ctx.lineTo(x1,H-gap*0.45);
+    ctx.stroke();
+
+    for (let s=0;s<NSTR;s++){
+      const y0=gap*(s+1), col=STR_COL[s];
+      const lvl=strLvl[s], pl=strPluck[s], w=strPhase[s];
+      const mode=1+Math.round(strNote[s]*4);
+      const amp=gap*0.46*(0.06+lvl*0.5+pl*0.6);
+
+      if (strHits[s]!==this.seen[s]){
+        this.seen[s]=strHits[s];
+        for (let k=0;k<mode;k++) this.spark.push({
+          x:x0+span*(2*k+1)/(2*mode), y:y0,
+          vx:(Math.random()-0.5)*0.32, vy:(Math.random()-0.5)*0.5-0.12,
+          a:1, i:rnd(NICON), c:col, s:gap*0.17*(0.5+lvl),
+          r:Math.random()*6, vr:(Math.random()-0.5)*0.01
+        });
+      }
+
+      // шкала полосы — собственно эквалайзер
+      ctx.globalAlpha=0.1+lvl*0.14; ctx.fillStyle=NEON[col];
+      ctx.fillRect(x0, y0-gap*0.3, span*lvl, gap*0.6);
+      ctx.globalAlpha=1;
+
+      // струна: широкий ореол + яркая нить
+      ctx.globalCompositeOperation='lighter';
+      for (let pass=0;pass<2;pass++){
+        ctx.beginPath();
+        for (let i=0;i<=N;i++){
+          const u=i/N;
+          const d=amp*(Math.sin(Math.PI*mode*u)*Math.sin(w)
+                     + 0.3*Math.sin(Math.PI*(mode+1)*u)*Math.sin(w*1.6+1.1));
+          if (i) ctx.lineTo(x0+span*u, y0+d); else ctx.moveTo(x0+span*u, y0+d);
+        }
+        ctx.strokeStyle=NEON[col];
+        ctx.globalAlpha=pass?0.95:0.2;
+        ctx.lineWidth=pass?(1.5+lvl*2.5):(7+lvl*10+pl*8);
+        ctx.stroke();
+      }
+      ctx.globalCompositeOperation='source-over';
+      ctx.globalAlpha=1;
+
+      // иконки катаются на пучностях — их столько, сколько нот в полосе
+      for (let k=0;k<mode;k++){
+        const u=(2*k+1)/(2*mode);
+        const d=amp*Math.sin(Math.PI*mode*u)*Math.sin(w);
+        icon(ctx,(this.ic[s]+k)%NICON, col, x0+span*u, y0+d,
+          gap*0.52*(0.5+lvl*0.45+pl*0.35), d*0.004, 0.7+lvl*0.3);
+      }
+      // колок слева вспыхивает на щипок
+      icon(ctx,(this.ic[s]+s)%NICON, pl>0.35?col:6, x0*0.5, y0,
+        gap*0.42*(0.5+pl*0.6), -pl*0.6, 0.35+pl*0.65);
+    }
+
+    for (let i=this.spark.length-1;i>=0;i--){
+      const o=this.spark[i];
+      o.x+=o.vx*dt; o.y+=o.vy*dt; o.vy+=dt*0.0009;
+      o.r+=o.vr*dt; o.a-=dt*0.0016;
+      if (o.a<=0){ this.spark.splice(i,1); continue; }
+      icon(ctx,o.i,o.c,o.x,o.y,o.s*o.a,o.r,o.a);
+    }
+    if (this.spark.length>160) this.spark.splice(0,this.spark.length-160);
+  });
+strings5.needsMic = true;
+
+// 0б. BAR EQ — классические столбцы: 5 полос, падающие пиковые шапки, отражение
+const barEq = S('BAR EQ',
+  function(){
+    this.peak=new Float32Array(NSTR); this.vel=new Float32Array(NSTR);
+    this.ic=[]; for(let s=0;s<NSTR;s++) this.ic.push(rnd(NICON));
+  },
+  function(ctx,t,dt){
+    ctx.fillStyle='rgba(0,0,0,0.45)'; ctx.fillRect(0,0,W,H);
+    const w=W/NSTR, base=H*0.8, maxh=H*0.68;
+    for (let s=0;s<NSTR;s++){
+      const col=STR_COL[s], lvl=Math.min(1,strLvl[s]+strPluck[s]*0.35);
+      const h=maxh*(0.03+lvl*0.97);
+      // шапка догоняет столб мгновенно, а падает с ускорением
+      if (h>=this.peak[s]){ this.peak[s]=h; this.vel[s]=0; }
+      else { this.vel[s]+=dt*0.006; this.peak[s]=Math.max(h,this.peak[s]-this.vel[s]*dt*0.12); }
+      const cx=w*s+w/2, bw=w*0.5;
+      ctx.globalCompositeOperation='lighter';
+      ctx.fillStyle=NEON[col];
+      ctx.globalAlpha=0.8;  ctx.fillRect(cx-bw/2, base-h, bw, h);
+      ctx.globalAlpha=0.13; ctx.fillRect(cx-bw*0.85, base-h, bw*1.7, h);   // ореол
+      for (let k=0;k<6;k++){                                               // отражение
+        ctx.globalAlpha=0.16*(1-k/6);
+        ctx.fillRect(cx-bw/2, base+h*0.08*k, bw, h*0.08);
+      }
+      ctx.globalCompositeOperation='source-over'; ctx.globalAlpha=1;
+      ctx.fillStyle='#fff'; ctx.globalAlpha=0.85;
+      ctx.fillRect(cx-bw/2, base-this.peak[s]-3, bw, 3);
+      ctx.globalAlpha=1;
+      icon(ctx,(this.ic[s]+strHits[s])%NICON, col, cx, base-h-w*0.24,
+        w*0.32*(0.6+lvl*0.5), strPhase[s]*0.12, 0.75+lvl*0.25);
+    }
+    ctx.fillStyle='rgba(255,255,255,0.18)'; ctx.fillRect(0,base,W,1);
+  });
+barEq.needsMic = true;
+
+// 0в. LED EQ — ретро-столбики из сегментов: горит столько ячеек, сколько громкости,
+// верхние сегменты уходят в жёлтый и красный, белая ячейка — пик
+const ledEq = S('LED EQ',
+  function(){ this.seg=12; this.peak=new Float32Array(NSTR); },
+  function(ctx,t,dt){
+    ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
+    const seg=this.seg, w=W/NSTR;
+    const cell=Math.min(w*0.7, H*0.82/seg);
+    const top=CY-(seg-1)*cell*1.06/2;
+    for (let s=0;s<NSTR;s++){
+      const lvl=Math.min(1,strLvl[s]+strPluck[s]*0.3);
+      const on=Math.round(lvl*seg);
+      this.peak[s]=Math.max(on, this.peak[s]-dt*0.0045);
+      const pk=Math.floor(this.peak[s]);
+      for (let k=0;k<seg;k++){
+        const lit=k<on;
+        const c = lit ? (k>=seg-2 ? 0 : (k>=seg-4 ? 3 : STR_COL[s])) : 9;
+        icon(ctx,(s*2+k)%NICON, (pk===k&&pk>0)?6:c,
+          w*s+w/2, top+(seg-1-k)*cell*1.06,
+          cell*(lit?0.94:0.72), 0, lit?1:0.13);
+      }
+    }
+  });
+ledEq.needsMic = true;
+
+// 0г. RADIAL EQ — пять колец: радиус кольца дышит от громкости полосы,
+// число лепестков берётся из ноты — кольцо «звенит» на своей гармонике
+const radialEq = S('RADIAL EQ',
+  function(){ this.rot=0; },
+  function(ctx,t,dt){
+    ctx.fillStyle='rgba(0,0,0,0.3)'; ctx.fillRect(0,0,W,H);
+    this.rot += dt*0.00014*speed;
+    const NP=170;
+    for (let s=0;s<NSTR;s++){
+      const col=STR_COL[s], lvl=strLvl[s], pl=strPluck[s];
+      const lobes=2+Math.round(strNote[s]*6);
+      const dir=(s%2)?-1:1, ph=strPhase[s];
+      const r0=MIN*(0.1+s*0.073)*(1+pl*0.07);
+      const amp=r0*(0.05+lvl*0.32);
+      ctx.beginPath();
+      for (let i=0;i<=NP;i++){
+        const a=i/NP*Math.PI*2 + this.rot*dir;
+        const r=r0+amp*Math.sin(lobes*a+ph);
+        const x=CX+Math.cos(a)*r, y=CY+Math.sin(a)*r;
+        if (i) ctx.lineTo(x,y); else ctx.moveTo(x,y);
+      }
+      ctx.closePath();
+      ctx.globalCompositeOperation='lighter';
+      ctx.strokeStyle=NEON[col];
+      ctx.globalAlpha=0.2;  ctx.lineWidth=6+lvl*12+pl*10; ctx.stroke();
+      ctx.globalAlpha=0.95; ctx.lineWidth=1.5+lvl*2.5;    ctx.stroke();
+      ctx.globalCompositeOperation='source-over'; ctx.globalAlpha=1;
+      for (let k=0;k<lobes;k++){                    // иконки сидят на гребнях
+        const a=(Math.PI/2 - ph + Math.PI*2*k)/lobes;
+        const aa=a+this.rot*dir;
+        icon(ctx,(s*3+k)%NICON, col, CX+Math.cos(aa)*(r0+amp), CY+Math.sin(aa)*(r0+amp),
+          MIN*0.055*(0.45+lvl*0.6+pl*0.4), aa, 0.55+lvl*0.45);
+      }
+    }
+  });
+radialEq.needsMic = true;
+
+// 0д. MIRROR EQ — зеркальная развёртка: полосы копятся стопкой от центра
+// и уезжают влево, так что видно последние пару секунд трека
+const mirrorEq = S('MIRROR EQ',
+  function(){
+    this.n=Math.max(48,Math.min(170,Math.round(W/8)));
+    this.acc=0;
+    this.hist=[];                       // предзаполняем тишиной, чтобы лента шла от края
+    for (let i=0;i<this.n;i++) this.hist.push(new Float32Array(NSTR));
+  },
+  function(ctx,t,dt){
+    ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
+    this.acc+=dt*speed;
+    while (this.acc>26){
+      this.acc-=26;
+      const f=new Float32Array(NSTR);
+      for (let s=0;s<NSTR;s++) f[s]=Math.min(1,strLvl[s]+strPluck[s]*0.4);
+      this.hist.push(f);
+      if (this.hist.length>this.n) this.hist.shift();
+    }
+    const n=this.hist.length;
+    if (!n) return;
+    const step=W/(this.n-1), unit=H*0.4/NSTR;
+    // рисуем от верхнего слоя к нижнему — младшие полосы просто закрашивают старших
+    for (let s=NSTR-1;s>=0;s--){
+      const cum=i=>{ let v=0; for(let j=0;j<=s;j++) v+=this.hist[i][j]; return unit*(0.12+v); };
+      for (let dir=-1;dir<=1;dir+=2){
+        ctx.beginPath();
+        ctx.moveTo(W-(n-1)*step, CY);
+        for (let i=0;i<n;i++) ctx.lineTo(W-(n-1-i)*step, CY+dir*cum(i));
+        ctx.lineTo(W, CY);
+        ctx.closePath();
+        ctx.fillStyle=NEON[STR_COL[s]];
+        ctx.globalAlpha=dir<0?0.85:0.5;
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha=1;
+    // текущий срез справа — иконки на границах слоёв
+    let v=0;
+    for (let s=0;s<NSTR;s++){
+      v+=this.hist[n-1][s];
+      const y=CY-unit*(0.12+v);
+      icon(ctx,(s*4)%NICON, STR_COL[s], W-MIN*0.05, y,
+        MIN*0.07*(0.5+strLvl[s]*0.6+strPluck[s]*0.4), 0, 0.7+strLvl[s]*0.3);
+    }
+    ctx.fillStyle='rgba(255,255,255,0.14)'; ctx.fillRect(0,CY,W,1);
+  });
+mirrorEq.needsMic = true;
+
+const scenes = [strings5, barEq, ledEq, radialEq, mirrorEq,
+  mega, warp, kaleido, acid, plasma, grid, zoomT, floor, plasmaBW,
   matrix, rings, strobe, fireworks,
   pendulum, lissa, radar, ripple, horizon, rotor, ink, moire, poly, spot];
 
@@ -947,7 +1250,9 @@ function setScene(i){
   prevIdx=sceneIdx; sceneIdx=next;
   transStart=performance.now();
   scenes[sceneIdx].init();
-  flashMsg((sceneIdx+1)+' / '+scenes.length+' · '+scenes[sceneIdx].name);
+  let msg=(sceneIdx+1)+' / '+scenes.length+' · '+scenes[sceneIdx].name;
+  if (scenes[sceneIdx].needsMic && !micOn) msg+=' · включи 🎤 (M / 3 пальца)';
+  flashMsg(msg);
 }
 
 // ---------- input ----------
@@ -1118,6 +1423,7 @@ function loop(t){
     requestAnimationFrame(loop); return;
   }
   micAnalyse(t);
+  stringsAnalyse(t,dt);
   const cur=scenes[sceneIdx];
   try { cur.draw(cur.ctx,t,dt); } catch(err){ console.error(cur.name, err); }
   const inTrans = transStart>0 && t-transStart<TRANS_MS && prevIdx>=0;
@@ -1142,7 +1448,7 @@ requestAnimationFrame(loop);
 const standalone = window.navigator.standalone === true ||
   (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
 const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
-flashMsg('1 / 23 · MEGA PULSE — тап: сцена · 2 пальца: темп · 3: 🎤 · 4: синхрон видео');
+flashMsg('1 / '+scenes.length+' · 5 STRINGS — тап: сцена · 2 пальца: темп · 3: 🎤 · 4: синхрон видео');
 if (isIOS && !standalone){
   setTimeout(()=>flashMsg('Поделиться → На экран «Домой» — тогда будет весь экран'), 6000);
 }
